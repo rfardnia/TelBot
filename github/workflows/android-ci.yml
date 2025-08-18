@@ -1,0 +1,127 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      BUILD_TIME_UTC: ${{ github.event.head_commit.timestamp || github.run_started_at }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Install Android SDK + accept licenses (offline-safe)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          # ------- cmdline-tools -------
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+          sdk="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          # ------- Licenses (hashes) -------
+          mkdir -p "$ANDROID_SDK_ROOT/licenses"
+          cat > "$ANDROID_SDK_ROOT/licenses/android-sdk-license" <<'EOF'
+          24333f8a63b6825ea9c5514f83c2829b004
+          24333f8a63b6825ea9c5514f83c2829b004d1
+          d56f5187479451eabf01fb78af6dfcb131a6481e
+          8933bad161af4178b1185d1a37fbf41ea5269c55
+          EOF
+          echo "84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_SDK_ROOT/licenses/android-sdk-preview-license"
+
+          # Accept licenses (Broken pipe is fine)
+          yes | "$sdk" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null || true
+
+          # ------- Install required packages -------
+          "$sdk" --sdk_root="$ANDROID_SDK_ROOT" --install             "platform-tools"             "platforms;android-34"             "build-tools;34.0.0"
+
+          # One more pass just in case
+          yes | "$sdk" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null || true
+
+          # Add adb to PATH for next steps
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Ensure Gradle is available (create wrapper if missing)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if command -v gradle >/dev/null 2>&1; then
+            echo "GRADLE=$(command -v gradle)" >> "$GITHUB_ENV"
+          else
+            curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+            unzip -q /tmp/gradle.zip -d "$HOME"
+            echo "GRADLE=$HOME/gradle-8.7/bin/gradle" >> "$GITHUB_ENV"
+          fi
+
+      - name: Init Gradle wrapper if absent
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -f "./gradlew" ]; then
+            "$GRADLE" --version
+            "$GRADLE" wrapper --gradle-version 8.7
+          fi
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Build (assembleDebug) + measure time
+        id: build
+        shell: bash
+        run: |
+          set -eux
+          start=$(date +%s)
+
+          if ./gradlew --no-daemon -q tasks --all | grep -q "assembleDebug"; then
+            ./gradlew --no-daemon assembleDebug
+          else
+            echo "::warning ::assembleDebug task not found; trying 'assemble'"
+            ./gradlew --no-daemon assemble
+          fi
+
+          end=$(date +%s)
+          elapsed=$(( end - start ))
+          mins=$(( elapsed / 60 ))
+          secs=$(( elapsed % 60 ))
+          pretty=$(printf "%02d:%02d" "$mins" "$secs")
+
+          echo "::notice ::Build duration: ${pretty} (=${elapsed}s)"
+          {
+            echo "### ⏱️ Android build time"
+            echo ""
+            echo "- Duration: **${pretty}** (= ${elapsed} seconds)"
+            echo "- Project dir: \`${PWD}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "seconds=${elapsed}" >> "$GITHUB_OUTPUT"
+          echo "pretty=${pretty}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts (APK/AAB)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: |
+            app/**/build/outputs/apk/**/*.apk
+            app/**/build/outputs/bundle/**/*.aab
+          if-no-files-found: warn
